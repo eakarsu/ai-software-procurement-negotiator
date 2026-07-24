@@ -1,49 +1,24 @@
+import crypto from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { aiTools, getAITool } from '@/lib/aiTools';
 import { appendAuditEntry } from '@/lib/auditStore';
 import { requireSession } from '@/lib/requestAuth';
+import { governedQuery } from '@/lib/governedPostgres';
 
-async function callConfiguredAI(system: string, prompt: string) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
-
-  const baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
-  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-  const response = await fetch(baseUrl + '/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + apiKey,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: prompt },
-      ],
-      temperature: 0.2,
-    }),
+async function callOpenRouter(system: string, prompt: string) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  const baseUrl = process.env.OPENROUTER_BASE_URL;
+  const model = process.env.OPENROUTER_MODEL;
+  if (!apiKey || !baseUrl || !model) throw new Error('OpenRouter is not configured');
+  const response = await fetch(baseUrl.replace(/\/$/, '') + '/chat/completions', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }], temperature: 0.2 }),
   });
-
-  if (!response.ok) {
-    throw new Error('AI provider returned ' + response.status);
-  }
-
-  const payload = await response.json();
-  return payload?.choices?.[0]?.message?.content as string | undefined;
-}
-
-function localResponse(toolTitle: string, prompt: string, signals: string[]) {
-  const trimmedPrompt = prompt.trim();
-  return [
-    toolTitle + ' response',
-    '',
-    'Summary: ' + trimmedPrompt.slice(0, 260) + (trimmedPrompt.length > 260 ? '...' : ''),
-    '',
-    'Recommended next actions:',
-    ...signals.slice(0, 4).map((signal, index) => String(index + 1) + '. Review ' + signal + ' and assign an owner.'),
-    String(Math.min(signals.length + 1, 5)) + '. Update the audit trail after the review is accepted.',
-  ].join('\n');
+  if (!response.ok) throw new Error('OpenRouter returned ' + response.status);
+  const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const content = payload.choices?.[0]?.message?.content?.trim();
+  if (!content) throw new Error('OpenRouter returned empty content');
+  return { content, model };
 }
 
 export async function GET(request: NextRequest) {
@@ -55,30 +30,18 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const session = requireSession(request);
   if (session instanceof NextResponse) return session;
-
   const body = await request.json().catch(() => null) as { toolId?: string; input?: string } | null;
   const tool = getAITool(body?.toolId || 'suite-assistant');
   const input = body?.input?.trim() || tool.defaultPrompt;
-  const system = 'You are ' + tool.title + '. Stay inside this suite workflow. Return concise operational guidance with risks, next actions, and audit notes.';
-
-  let response: string;
-  let provider = 'local-pilot';
-  try {
-    const aiResponse = await callConfiguredAI(system, input);
-    response = aiResponse || localResponse(tool.title, input, tool.signals);
-    provider = aiResponse ? 'configured-ai' : provider;
-  } catch {
-    response = localResponse(tool.title, input, tool.signals);
-    provider = 'local-fallback';
-  }
-
+  const result = await callOpenRouter('You are ' + tool.title + '. Return concise procurement guidance with risks, next actions, and audit notes.', input);
+  const identity = await governedQuery<{ tenant_id: string }>('SELECT tenant_id FROM procurement_app_users WHERE email=$1 AND status=\'active\'', [session.email]);
+  if (!identity.rows[0]) return NextResponse.json({ error: 'Identity inactive' }, { status: 401 });
+  const persistedId = crypto.randomUUID();
+  await governedQuery(
+    `INSERT INTO procurement_runtime_ai_results(id,tenant_id,actor_email,tool_id,prompt,content,provider,model)
+     VALUES($1,$2,$3,$4,$5,$6,'openrouter',$7)`,
+    [persistedId, identity.rows[0].tenant_id, session.email, tool.id, input, result.content, result.model],
+  );
   await appendAuditEntry('AI Tools', ((session.firstName + ' ' + session.lastName).trim() || session.email) + ' ran ' + tool.title);
-
-  return NextResponse.json({
-    tool,
-    input,
-    response,
-    provider,
-    createdAt: new Date().toISOString(),
-  });
+  return NextResponse.json({ tool, input, response: result.content, content: result.content, provider: 'openrouter', model: result.model, persistedId, createdAt: new Date().toISOString() });
 }

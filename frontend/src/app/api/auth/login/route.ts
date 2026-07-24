@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { AUTH_COOKIE, encodeSession, validateDemoCredentials } from '@/lib/auth';
+import { AUTH_COOKIE, encodeSession } from '@/lib/auth';
+import { authenticateDatabaseUser } from '@/lib/databaseAuth';
 
 export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => null);
   const email = body?.email ?? '';
   const password = body?.password ?? '';
 
-  const user = validateDemoCredentials(email, password);
+  const user = await authenticateDatabaseUser(email, password);
   if (!user) {
     return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 });
   }
@@ -15,7 +16,7 @@ export async function POST(request: NextRequest) {
   response.cookies.set(AUTH_COOKIE, encodeSession(user), {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: process.env.SESSION_COOKIE_SECURE === 'true',
     path: '/',
     maxAge: 60 * 60 * 8,
   });

@@ -1,51 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$project_dir/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$project_dir/.env"
+  set +a
+fi
+export API_PORT="${API_PORT:-${BACKEND_PORT:-}}"
+export UI_PORT="${UI_PORT:-${FRONTEND_PORT:-}}"
 
-fail() {
-  printf 'error: %s\n' "$*" >&2
-  exit 1
+fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
+check_config() {
+  [[ "${DATABASE_URL:-}" == postgres://* || "${DATABASE_URL:-}" == postgresql://* ]] || fail 'DATABASE_URL must be PostgreSQL'
+  [[ ${#SESSION_SECRET} -ge 32 ]] || fail 'SESSION_SECRET must contain at least 32 characters'
+  [[ -n "${OPENROUTER_API_KEY:-}" && -n "${OPENROUTER_MODEL:-}" && -n "${OPENROUTER_BASE_URL:-}" ]] || fail 'OpenRouter configuration is required'
+  [[ -n "${API_PORT:-}" && -n "${UI_PORT:-}" && "$API_PORT" != "$UI_PORT" ]] || fail 'distinct API_PORT and UI_PORT are required'
 }
-
-check() {
-  local governance_secret="${GOVERNANCE_GATEWAY_SECRET:-}"
-  local session_secret="${SESSION_SECRET:-}"
-  case "${DATABASE_URL:-}" in
-    postgres://*|postgresql://*) ;;
-    *) fail "DATABASE_URL must be an explicit PostgreSQL connection string" ;;
-  esac
-  [ "${#session_secret}" -ge 32 ] || fail "SESSION_SECRET must contain at least 32 characters"
-  if [ "${NODE_ENV:-development}" = test ]; then
-    ENABLE_DEMO_AUTH="${ENABLE_DEMO_AUTH:-true}"
-    DEMO_ADMIN_EMAIL="${DEMO_ADMIN_EMAIL:-${ADMIN_EMAIL:-${DEMO_EMAIL:-}}}"
-    DEMO_ADMIN_PASSWORD="${DEMO_ADMIN_PASSWORD:-${ADMIN_PASSWORD:-${DEMO_PASSWORD:-}}}"
-    RUNTIME_VALIDATION_AUTH=true
-    export ENABLE_DEMO_AUTH DEMO_ADMIN_EMAIL DEMO_ADMIN_PASSWORD RUNTIME_VALIDATION_AUTH
-  else
-    [ "${#governance_secret}" -ge 32 ] || fail "GOVERNANCE_GATEWAY_SECRET must contain at least 32 characters"
-  fi
-  if [ "${NODE_ENV:-development}" = production ]; then
-    [ -n "${PGSSLROOTCERT:-}" ] || fail "PGSSLROOTCERT is required for remote production database verification"
-  fi
+migrate() {
+  [[ "${ALLOW_SCHEMA_MIGRATION:-}" == 1 || "${ALLOW_SCHEMA_MIGRATION:-}" == true ]] || fail 'set ALLOW_SCHEMA_MIGRATION=true for the approved migration step'
+  for migration in "$project_dir"/migrations/*.sql; do
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
+  done
+}
+start_services() {
+  migrate
+  node "$project_dir/frontend/scripts/create-admin.mjs"
+  npm --prefix "$project_dir/frontend" run start -- -H 127.0.0.1 -p "$API_PORT" &
+  app_pid=$!
+  API_PORT="$API_PORT" UI_PORT="$UI_PORT" node "$project_dir/frontend/scripts/runtime-proxy.mjs" &
+  proxy_pid=$!
+  wait "$app_pid" "$proxy_pid"
 }
 
 case "${1:-start}" in
-  check)
-    check
-    ;;
-  migrate)
-    check
-    [ "${ALLOW_SCHEMA_MIGRATION:-0}" = 1 ] || fail "set ALLOW_SCHEMA_MIGRATION=1 for the approved migration step"
-    command -v psql >/dev/null 2>&1 || fail "psql is required"
-    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$ROOT_DIR/migrations/001_governed_procurement_jobs.sql"
-    ;;
-  start)
-    check
-    [ -d "$ROOT_DIR/frontend/node_modules" ] || fail "frontend dependencies are missing; install explicitly"
-    [ -f "$ROOT_DIR/frontend/.next/BUILD_ID" ] || fail "production build is missing; build explicitly"
-    cd "$ROOT_DIR/frontend"
-    exec npm start -- -p "${PORT:-5304}"
-    ;;
-  *) fail "usage: ./start.sh [check|migrate|start]" ;;
+  check) npm --prefix "$project_dir/frontend" run typecheck && node --test "$project_dir"/governance/*.test.cjs && NODE_ENV=production npm --prefix "$project_dir/frontend" run build ;;
+  migrate) check_config; migrate ;;
+  start) check_config; start_services ;;
+  *) fail 'usage: ./start.sh [check|migrate|start]' ;;
 esac
