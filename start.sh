@@ -104,7 +104,9 @@ migrate() {
 start_services() {
   migrate
   node "$project_dir/frontend/scripts/create-admin.mjs"
-  npm --prefix "$project_dir/frontend" run start -- -H 127.0.0.1 -p "$API_PORT" &
+  frontend_script=start
+  if [[ "${NODE_ENV:-development}" != production ]]; then frontend_script=dev; fi
+  npm --prefix "$project_dir/frontend" run "$frontend_script" -- -H 127.0.0.1 -p "$API_PORT" &
   app_pid=$!
   API_PORT="$API_PORT" UI_PORT="$UI_PORT" node "$project_dir/frontend/scripts/runtime-proxy.mjs" &
   proxy_pid=$!
